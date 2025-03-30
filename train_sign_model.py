@@ -44,14 +44,20 @@ class SignLanguageDataset(Dataset):
         video_path = self.video_paths[idx]
         label = self.labels[idx]
         
-        # Extract landmarks
-        landmarks = self.recognizer.extract_landmarks(video_path)
-        
-        # Convert to tensor
-        landmarks_tensor = torch.tensor(landmarks, dtype=torch.float32)
-        label_tensor = torch.tensor(label, dtype=torch.long)
-        
-        return landmarks_tensor, label_tensor
+        try:
+            # Extract landmarks
+            landmarks = self.recognizer.extract_landmarks(video_path)
+            
+            # Convert to tensor
+            landmarks_tensor = torch.tensor(landmarks, dtype=torch.float32)
+            label_tensor = torch.tensor(label, dtype=torch.long)
+            
+            return landmarks_tensor, label_tensor
+        except Exception as e:
+            print(f"Error processing video {video_path}: {e}")
+            # Return empty landmarks in case of error
+            empty_landmarks = np.zeros((self.max_frames, 543))
+            return torch.tensor(empty_landmarks, dtype=torch.float32), torch.tensor(label, dtype=torch.long)
 
 def download_wlasl_videos(data, output_dir='data/wlasl/videos', limit=10):
     """Download videos from the WLASL dataset."""
@@ -79,9 +85,26 @@ def download_wlasl_videos(data, output_dir='data/wlasl/videos', limit=10):
             
             # Skip if already downloaded
             if os.path.exists(output_path):
-                video_paths.append(output_path)
-                video_labels.append(label_idx)
-                continue
+                # Verify the video file is valid
+                try:
+                    cap = cv2.VideoCapture(output_path)
+                    if not cap.isOpened():
+                        print(f"Warning: Existing video file {output_path} is corrupted. Re-downloading...")
+                        os.remove(output_path)
+                    else:
+                        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                        if frame_count <= 0:
+                            print(f"Warning: Existing video file {output_path} has no frames. Re-downloading...")
+                            os.remove(output_path)
+                            cap.release()
+                        else:
+                            cap.release()
+                            video_paths.append(output_path)
+                            video_labels.append(label_idx)
+                            continue
+                except Exception as e:
+                    print(f"Error verifying video {output_path}: {e}")
+                    os.remove(output_path)
                 
             try:
                 # Download the video
@@ -91,12 +114,31 @@ def download_wlasl_videos(data, output_dir='data/wlasl/videos', limit=10):
                         for chunk in response.iter_content(chunk_size=1024):
                             if chunk:
                                 f.write(chunk)
+                    
+                    # Verify the downloaded video
+                    cap = cv2.VideoCapture(output_path)
+                    if not cap.isOpened():
+                        print(f"Warning: Downloaded video {output_path} is corrupted. Skipping...")
+                        os.remove(output_path)
+                        continue
+                    
+                    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                    if frame_count <= 0:
+                        print(f"Warning: Downloaded video {output_path} has no frames. Skipping...")
+                        os.remove(output_path)
+                        cap.release()
+                        continue
+                    
+                    cap.release()
                     video_paths.append(output_path)
                     video_labels.append(label_idx)
                 else:
                     print(f"Failed to download {video_id}: HTTP {response.status_code}")
             except Exception as e:
                 print(f"Error downloading {video_id}: {e}")
+                # Remove partially downloaded file if it exists
+                if os.path.exists(output_path):
+                    os.remove(output_path)
     
     return video_paths, video_labels, label_to_gloss
 
@@ -215,10 +257,28 @@ def main():
     print(f"Downloaded {len(video_paths)} videos")
     print(f"Label to gloss mapping: {label_to_gloss}")
     
+    # Check if we have enough videos
+    if len(video_paths) < 2:
+        print("Error: Not enough valid videos found. Please check your internet connection and try again.")
+        return
+    
+    # Check if we have at least one video for each class
+    unique_labels = set(video_labels)
+    if len(unique_labels) < 2:
+        print(f"Error: Only found videos for {len(unique_labels)} classes. Need at least 2 classes for training.")
+        return
+    
     # Split the data into train and test sets
-    train_paths, test_paths, train_labels, test_labels = train_test_split(
-        video_paths, video_labels, test_size=0.2, random_state=42, stratify=video_labels
-    )
+    try:
+        train_paths, test_paths, train_labels, test_labels = train_test_split(
+            video_paths, video_labels, test_size=0.2, random_state=42, stratify=video_labels
+        )
+    except ValueError as e:
+        print(f"Error splitting data: {e}")
+        print("Trying without stratification...")
+        train_paths, test_paths, train_labels, test_labels = train_test_split(
+            video_paths, video_labels, test_size=0.2, random_state=42
+        )
     
     print(f"Training set: {len(train_paths)} videos")
     print(f"Test set: {len(test_paths)} videos")

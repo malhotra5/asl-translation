@@ -92,9 +92,19 @@ class SignRecognizer:
         # Get video properties
         frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         fps = cap.get(cv2.CAP_PROP_FPS)
+        
+        # Handle case where fps is zero
+        if fps <= 0:
+            fps = 30.0  # Default to 30 fps if not detected
+            print(f"Warning: Could not determine FPS for {video_path}, using default value of {fps}")
+            
         duration = frame_count / fps
         
         # Calculate frames to sample
+        if frame_count <= 0:
+            print(f"Warning: No frames detected in {video_path}, using empty landmarks")
+            return np.zeros((self.max_frames, 543))
+            
         if frame_count <= self.max_frames:
             frames_to_sample = list(range(frame_count))
         else:
