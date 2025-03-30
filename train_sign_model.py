@@ -7,6 +7,7 @@ This script handles the training of the sign language recognition model.
 import os
 import json
 import random
+import datetime
 import numpy as np
 import torch
 import torch.nn as nn
@@ -15,6 +16,7 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 import requests
+import cv2
 from sign_recognition import SignLanguageModel, SignRecognizer
 
 # Set random seed for reproducibility
@@ -60,7 +62,11 @@ class SignLanguageDataset(Dataset):
             return torch.tensor(empty_landmarks, dtype=torch.float32), torch.tensor(label, dtype=torch.long)
 
 def download_wlasl_videos(data, output_dir='data/wlasl/videos', limit=10):
-    """Download videos from the WLASL dataset."""
+    """
+    Process videos from the WLASL dataset.
+    If videos already exist locally, they will be used without redownloading.
+    Only missing or corrupted videos will be downloaded.
+    """
     os.makedirs(output_dir, exist_ok=True)
     
     # Keep track of videos and their labels
@@ -68,10 +74,43 @@ def download_wlasl_videos(data, output_dir='data/wlasl/videos', limit=10):
     video_labels = []
     label_to_gloss = {}
     
-    for label_idx, entry in enumerate(tqdm(data[:limit], desc="Downloading videos")):
+    # First, check if we already have a metadata file with video paths and labels
+    metadata_path = os.path.join(output_dir, "metadata.json")
+    if os.path.exists(metadata_path):
+        try:
+            print(f"Loading existing metadata from {metadata_path}")
+            with open(metadata_path, 'r') as f:
+                metadata = json.load(f)
+                
+            # Verify that the metadata matches our current limit
+            if metadata.get('limit') == limit:
+                # Check if all the videos in the metadata exist and are valid
+                all_valid = True
+                for video_path in metadata.get('video_paths', []):
+                    if not os.path.exists(video_path):
+                        all_valid = False
+                        break
+                
+                if all_valid:
+                    print(f"Using {len(metadata.get('video_paths', []))} existing videos from metadata")
+                    return (
+                        metadata.get('video_paths', []),
+                        metadata.get('video_labels', []),
+                        metadata.get('label_to_gloss', {})
+                    )
+                else:
+                    print("Some videos in metadata are missing. Rebuilding dataset...")
+            else:
+                print(f"Metadata limit ({metadata.get('limit')}) doesn't match current limit ({limit}). Rebuilding dataset...")
+        except Exception as e:
+            print(f"Error loading metadata: {e}. Rebuilding dataset...")
+    
+    # Process each gloss (word) up to the limit
+    for label_idx, entry in enumerate(tqdm(data[:limit], desc="Processing videos")):
         gloss = entry['gloss']
         label_to_gloss[label_idx] = gloss
         
+        # Process each instance of the gloss
         for instance in entry['instances']:
             video_id = instance['video_id']
             video_url = instance.get('url', '')
@@ -83,29 +122,30 @@ def download_wlasl_videos(data, output_dir='data/wlasl/videos', limit=10):
             # Define output path
             output_path = os.path.join(output_dir, f"{video_id}.mp4")
             
-            # Skip if already downloaded
+            # Check if the video already exists and is valid
             if os.path.exists(output_path):
-                # Verify the video file is valid
                 try:
+                    # Quick validation check
                     cap = cv2.VideoCapture(output_path)
-                    if not cap.isOpened():
-                        print(f"Warning: Existing video file {output_path} is corrupted. Re-downloading...")
-                        os.remove(output_path)
+                    if cap.isOpened() and int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) > 0:
+                        cap.release()
+                        video_paths.append(output_path)
+                        video_labels.append(label_idx)
+                        continue
                     else:
-                        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                        if frame_count <= 0:
-                            print(f"Warning: Existing video file {output_path} has no frames. Re-downloading...")
-                            os.remove(output_path)
-                            cap.release()
-                        else:
-                            cap.release()
-                            video_paths.append(output_path)
-                            video_labels.append(label_idx)
-                            continue
+                        # Invalid video, will redownload
+                        cap.release()
+                        print(f"Video {output_path} is invalid. Will redownload.")
+                        os.remove(output_path)
                 except Exception as e:
-                    print(f"Error verifying video {output_path}: {e}")
-                    os.remove(output_path)
-                
+                    print(f"Error checking video {output_path}: {e}")
+                    try:
+                        os.remove(output_path)
+                    except:
+                        pass
+            
+            # If we get here, we need to download the video
+            print(f"Downloading {video_id} for gloss '{gloss}'")
             try:
                 # Download the video
                 response = requests.get(video_url, stream=True, timeout=10)
@@ -117,28 +157,40 @@ def download_wlasl_videos(data, output_dir='data/wlasl/videos', limit=10):
                     
                     # Verify the downloaded video
                     cap = cv2.VideoCapture(output_path)
-                    if not cap.isOpened():
-                        print(f"Warning: Downloaded video {output_path} is corrupted. Skipping...")
-                        os.remove(output_path)
-                        continue
-                    
-                    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                    if frame_count <= 0:
-                        print(f"Warning: Downloaded video {output_path} has no frames. Skipping...")
-                        os.remove(output_path)
+                    if cap.isOpened() and int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) > 0:
                         cap.release()
-                        continue
-                    
-                    cap.release()
-                    video_paths.append(output_path)
-                    video_labels.append(label_idx)
+                        video_paths.append(output_path)
+                        video_labels.append(label_idx)
+                        print(f"Successfully downloaded {video_id}")
+                    else:
+                        cap.release()
+                        print(f"Downloaded video {output_path} is invalid. Skipping...")
+                        os.remove(output_path)
                 else:
                     print(f"Failed to download {video_id}: HTTP {response.status_code}")
             except Exception as e:
                 print(f"Error downloading {video_id}: {e}")
                 # Remove partially downloaded file if it exists
                 if os.path.exists(output_path):
-                    os.remove(output_path)
+                    try:
+                        os.remove(output_path)
+                    except:
+                        pass
+    
+    # Save metadata for future use
+    try:
+        metadata = {
+            'video_paths': video_paths,
+            'video_labels': video_labels,
+            'label_to_gloss': label_to_gloss,
+            'limit': limit,
+            'timestamp': datetime.datetime.now().isoformat()
+        }
+        with open(metadata_path, 'w') as f:
+            json.dump(metadata, f)
+        print(f"Saved metadata to {metadata_path}")
+    except Exception as e:
+        print(f"Error saving metadata: {e}")
     
     return video_paths, video_labels, label_to_gloss
 
